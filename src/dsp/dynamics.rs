@@ -143,42 +143,83 @@ impl Reverb {
 }
 
 // ---------------------------------------------------------------------------
-// Peak limiter
+// Peak limiter (lookahead)
 // ---------------------------------------------------------------------------
+//
+// Two-pass lookahead limiter modelled after broadcast/mastering limiters.
+// Pass 1: scan the entire buffer and compute the minimum gain envelope
+//         needed so that no sample exceeds `threshold`.
+// Pass 2: apply that gain with smoothing (attack = lookahead, release = 100ms)
+//         so gain changes are gradual and artifact-free.
 
 pub struct Limiter {
     threshold: f64,
-    attack_coeff: f64,
+    lookahead: usize,
     release_coeff: f64,
-    env: f64,
 }
 
 impl Limiter {
     pub fn new(sr: f64, threshold_db: f64) -> Self {
-        let attack_ms = 0.1;
-        let release_ms = 50.0;
+        let lookahead_ms = 5.0;
+        let release_ms = 100.0;
         Self {
             threshold: 10.0_f64.powf(threshold_db / 20.0),
-            attack_coeff: (-1.0 / (attack_ms * 0.001 * sr)).exp(),
+            lookahead: (lookahead_ms * 0.001 * sr) as usize,
             release_coeff: (-1.0 / (release_ms * 0.001 * sr)).exp(),
-            env: 0.0,
         }
     }
 
     pub fn process_mono(&mut self, samples: &mut [f64]) {
-        for s in samples.iter_mut() {
-            let abs = s.abs();
-            // Envelope follower: fast attack, slow release
-            if abs > self.env {
-                self.env = self.attack_coeff * self.env + (1.0 - self.attack_coeff) * abs;
-            } else {
-                self.env = self.release_coeff * self.env + (1.0 - self.release_coeff) * abs;
-            }
+        let n = samples.len();
+        if n == 0 {
+            return;
+        }
 
-            // Apply gain reduction when envelope exceeds threshold
-            if self.env > self.threshold {
-                *s *= self.threshold / self.env;
+        let threshold = self.threshold;
+        let lookahead = self.lookahead.max(1);
+
+        // Pass 1: compute per-sample target gain (<=1.0)
+        let mut gain = vec![1.0_f64; n];
+        for (i, s) in samples.iter().enumerate() {
+            let abs = s.abs();
+            if abs > threshold {
+                gain[i] = threshold / abs;
             }
+        }
+
+        // Spread each gain reduction backward over the lookahead window
+        // so the limiter ramps down *before* the peak arrives.
+        // Walk backward: gain[i] must be <= gain[i+1] adjusted for ramp.
+        let mut smoothed = gain.clone();
+        for i in (0..n.saturating_sub(1)).rev() {
+            let dist = (i + lookahead).min(n - 1);
+            // Find minimum gain in the lookahead window ahead
+            let mut min_g = smoothed[i];
+            let mut j = i + 1;
+            while j <= dist {
+                if smoothed[j] < min_g {
+                    min_g = smoothed[j];
+                }
+                j += 1;
+            }
+            if min_g < smoothed[i] {
+                smoothed[i] = min_g;
+            }
+        }
+
+        // Pass 2: smooth the gain envelope (slow release to avoid pumping)
+        let mut current_gain = 1.0_f64;
+        let release = self.release_coeff;
+        for i in 0..n {
+            let target = smoothed[i];
+            if target < current_gain {
+                // Attack: jump to target immediately (lookahead already handled ramp)
+                current_gain = target;
+            } else {
+                // Release: exponential recovery
+                current_gain = release * current_gain + (1.0 - release) * target;
+            }
+            samples[i] *= current_gain;
         }
     }
 }
