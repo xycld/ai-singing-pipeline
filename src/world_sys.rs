@@ -19,7 +19,7 @@ pub struct D4COption {
     pub threshold: f64,
 }
 
-extern "C" {
+unsafe extern "C" {
     // Harvest — F0 estimation
     pub fn InitializeHarvestOption(option: *mut HarvestOption);
     pub fn GetSamplesForHarvest(fs: i32, x_length: i32, frame_period: f64) -> i32;
