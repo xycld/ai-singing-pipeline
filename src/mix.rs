@@ -58,6 +58,7 @@ pub fn process_mix(
         let (ref_channels, ref_sr) =
             audio::read_wav_stereo(ref_path).map_err(|e| Error::Audio(e.to_string()))?;
         let mut ref_channels = audio::ensure_stereo(ref_channels);
+        clamp_channels(&mut ref_channels);
 
         // Resample reference if needed
         if ref_sr != user_sr {
@@ -95,6 +96,7 @@ pub fn process_mix(
     let (inst_channels, inst_sr) =
         audio::read_wav_stereo(inst_path).map_err(|e| Error::Audio(e.to_string()))?;
     let mut inst_channels = audio::ensure_stereo(inst_channels);
+    clamp_channels(&mut inst_channels);
 
     if inst_sr != user_sr {
         for ch in inst_channels.iter_mut() {
@@ -164,6 +166,7 @@ pub fn process_mix(
     // 3.3 Comparison outputs (user + ref, guide mix)
     if let Ok((ref_ch, ref_sr)) = audio::read_wav_stereo(ref_path) {
         let mut ref_ch = audio::ensure_stereo(ref_ch);
+        clamp_channels(&mut ref_ch);
         if ref_sr != user_sr {
             for ch in ref_ch.iter_mut() {
                 *ch = audio::resample(ch, ref_sr, user_sr);
@@ -208,12 +211,29 @@ pub fn process_mix(
     Ok(())
 }
 
+/// Clamp channels to ±1.0 (Demucs float outputs can have rare spikes beyond this).
+fn clamp_channels(channels: &mut [Vec<f64>]) {
+    for ch in channels.iter_mut() {
+        for s in ch.iter_mut() {
+            *s = s.clamp(-1.0, 1.0);
+        }
+    }
+}
+
+fn clamp_mono(samples: &mut Vec<f64>) {
+    for s in samples.iter_mut() {
+        *s = s.clamp(-1.0, 1.0);
+    }
+}
+
 /// Analyze reference vocal and instrumental to extract target mixing parameters.
 fn analyze_reference(ref_path: &Path, inst_path: &Path) -> Result<ReferenceAnalysis> {
-    let (ref_mono, ref_sr) =
+    let (mut ref_mono, ref_sr) =
         audio::read_wav(ref_path).map_err(|e| Error::Audio(e.to_string()))?;
-    let (inst_mono, _inst_sr) =
+    let (mut inst_mono, _inst_sr) =
         audio::read_wav(inst_path).map_err(|e| Error::Audio(e.to_string()))?;
+    clamp_mono(&mut ref_mono);
+    clamp_mono(&mut inst_mono);
 
     let ref_db = audio::rms_db(&ref_mono);
     let inst_db = audio::rms_db(&inst_mono);
