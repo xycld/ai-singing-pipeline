@@ -235,9 +235,11 @@ pub fn stft(samples: &[f64], window_size: usize, hop_size: usize) -> Vec<Vec<Com
     let n_bins = window_size / 2 + 1;
 
     let mut frames = Vec::new();
-    let mut pos: isize = 0;
+    // Start at -window_size/2 to match librosa center=True behavior:
+    // each frame is centered at pos + window_size/2 = frame_index * hop_size.
+    let mut pos: isize = -(window_size as isize / 2);
 
-    while (pos as usize) < samples.len() + window_size / 2 {
+    while pos < samples.len() as isize {
         let mut buf: Vec<Complex64> = (0..window_size)
             .map(|j| {
                 let idx = pos + j as isize;

@@ -107,7 +107,9 @@ pub fn process_align(
         let a = &o_ref[s..s + win_eval];
         let b = &o_user[s..s + win_eval];
         if let Some(best_lag) = cross_correlate_peak(a, b, max_lag_eval) {
-            segment_lags.push(best_lag as f64 * eval_hop as f64 / FS as f64);
+            // Negate: our correlate convention is opposite to scipy's.
+            // Positive best_lag means user is ahead of ref, needs negative shift.
+            segment_lags.push(-best_lag as f64 * eval_hop as f64 / FS as f64);
         }
         s += hop_eval;
     }
