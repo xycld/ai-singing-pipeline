@@ -1,0 +1,42 @@
+[package]
+name = "ai-singing-pipeline"
+version = "0.1.0"
+edition = "2024"
+description = "AI singing vocal post-processing pipeline — denoise, align, pitch correct, mix"
+license = "Apache-2.0"
+repository = "https://github.com/xycld/ai-singing-pipeline"
+keywords = ["audio", "singing", "pitch-correction", "vocal", "dsp"]
+categories = ["multimedia::audio", "science"]
+
+[lib]
+name = "ai_singing_pipeline"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ai-singing-pipeline"
+path = "src/main.rs"
+
+[dependencies]
+hound = "3.5"
+rustfft = "6"
+rubato = "0.15"
+signalsmith-stretch = "0.1.3"
+tdpsola = "0.1.0"
+thiserror = "2"
+
+[dependencies.clap]
+version = "4"
+features = ["derive"]
+optional = true
+
+[dependencies.ort]
+version = "2.0.0-rc.12"
+optional = true
+
+[features]
+default = ["cli"]
+cli = ["clap"]
+denoise = ["ort"]
+
+[build-dependencies]
+cc = "1"
