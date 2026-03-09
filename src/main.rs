@@ -93,9 +93,6 @@ mod cli {
             /// Output sample rate
             #[arg(long, default_value_t = 44100)]
             sr: i32,
-            /// Path to rubberband binary
-            #[arg(long, default_value = "rubberband")]
-            rubberband_bin: PathBuf,
         },
 
         /// Pitch-correct user vocal using reference
@@ -205,14 +202,9 @@ mod cli {
                 ref_wav,
                 out_wav,
                 sr,
-                rubberband_bin,
             } => {
                 let config = PipelineConfig {
                     sample_rate: sr,
-                    align: AlignConfig {
-                        rubberband_bin,
-                        ..Default::default()
-                    },
                     ..Default::default()
                 };
                 Pipeline::new(config).align(&user_wav, &ref_wav, &out_wav)?;

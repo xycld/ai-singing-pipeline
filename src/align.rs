@@ -1,11 +1,10 @@
-//! Time-alignment via chroma features + DTW + RubberBand CLI.
+//! Time-alignment via chroma features + DTW + WSOLA.
 //!
 //! Port of align.py: extracts chroma features, runs band-constrained DTW,
 //! evaluates onset correlation, then either applies a global shift (Strategy A)
-//! or time-stretches via RubberBand CLI subprocess (Strategy B).
+//! or time-stretches via built-in WSOLA (Strategy B).
 
-use crate::{audio, Error, Result};
-use std::io::Write;
+use crate::{audio, dsp, Error, Result};
 use std::path::Path;
 
 /// Internal sample rate for alignment processing (matches librosa default).
@@ -17,15 +16,11 @@ const FEATURE_RATE: usize = 50;
 #[derive(Debug, Clone)]
 pub struct AlignConfig {
     pub safe_mode: bool,
-    pub rubberband_bin: std::path::PathBuf,
 }
 
 impl Default for AlignConfig {
     fn default() -> Self {
-        Self {
-            safe_mode: true,
-            rubberband_bin: std::path::PathBuf::from("rubberband"),
-        }
+        Self { safe_mode: true }
     }
 }
 
@@ -134,8 +129,8 @@ pub fn process_align(
         let shift_samples = (median_offset * FS as f64).round() as isize;
         apply_global_shift(&audio_user, shift_samples)
     } else {
-        // Strategy B: SmartAlign + RubberBand R3
-        eprintln!("   -> Strategy B: SmartAlign + RubberBand");
+        // Strategy B: SmartAlign + WSOLA
+        eprintln!("   -> Strategy B: SmartAlign + WSOLA");
         let step_b = FEATURE_RATE / 2; // ~2 anchors/second
         let lo = (0.12 * FS as f64) as f64;
         let hi = (0.40 * FS as f64) as f64;
@@ -177,12 +172,7 @@ pub fn process_align(
         timemap.push((audio_user.len(), target_len));
         eprintln!("   Anchors: {}", timemap.len());
 
-        rubberband_timemap_stretch(
-            &audio_user,
-            FS,
-            &timemap,
-            &config.rubberband_bin,
-        )?
+        dsp::timemap_stretch(&audio_user, &timemap)
     };
 
     // 5. Length matching
@@ -608,69 +598,3 @@ fn apply_global_shift(audio: &[f64], shift_samples: isize) -> Vec<f64> {
     }
 }
 
-/// Time-stretch audio using RubberBand CLI with a timemap file.
-fn rubberband_timemap_stretch(
-    audio: &[f64],
-    sr: i32,
-    timemap: &[(usize, usize)],
-    rubberband_bin: &Path,
-) -> Result<Vec<f64>> {
-    use std::process::Command;
-
-    // Write input audio to temp file
-    let tmp_dir = std::env::temp_dir();
-    let input_path = tmp_dir.join("_align_rb_input.wav");
-    let output_path = tmp_dir.join("_align_rb_output.wav");
-    let map_path = tmp_dir.join("_align_rb_timemap.txt");
-
-    audio::write_wav(&input_path, audio, sr).map_err(|e| Error::Audio(e.to_string()))?;
-
-    // Write timemap file (format: "source_frame target_frame\n")
-    {
-        let mut f = std::fs::File::create(&map_path)?;
-        for &(src, tgt) in timemap {
-            writeln!(f, "{} {}", src, tgt)?;
-        }
-    }
-
-    // Run RubberBand
-    let result = Command::new(rubberband_bin)
-        .arg("--timemap")
-        .arg(&map_path)
-        .arg("-3") // R3 engine (faster)
-        .arg("--formant") // preserve formants
-        .arg(&input_path)
-        .arg(&output_path)
-        .output();
-
-    // Clean up input + map regardless of result
-    let _ = std::fs::remove_file(&input_path);
-    let _ = std::fs::remove_file(&map_path);
-
-    match result {
-        Ok(output) => {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let _ = std::fs::remove_file(&output_path);
-                return Err(Error::Alignment(format!(
-                    "rubberband failed: {}",
-                    stderr.trim()
-                )));
-            }
-        }
-        Err(e) => {
-            return Err(Error::Alignment(format!(
-                "rubberband not found at '{}': {}",
-                rubberband_bin.display(),
-                e
-            )));
-        }
-    }
-
-    // Read output
-    let (aligned, _) =
-        audio::read_wav(&output_path).map_err(|e| Error::Audio(e.to_string()))?;
-    let _ = std::fs::remove_file(&output_path);
-
-    Ok(aligned)
-}
