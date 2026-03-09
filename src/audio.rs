@@ -1,14 +1,8 @@
-//! WAV I/O, resampling, STFT, and audio analysis utilities.
-
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use rustfft::{num_complex::Complex64, FftPlanner};
 use std::path::Path;
 
-// ---------------------------------------------------------------------------
-// WAV I/O
-// ---------------------------------------------------------------------------
-
-/// Read a WAV file into mono f64 samples + sample rate.
+/// Read a WAV file into mono f64 samples and sample rate.
 pub fn read_wav(path: &Path) -> Result<(Vec<f64>, i32), Box<dyn std::error::Error>> {
     let reader = WavReader::open(path)?;
     let spec = reader.spec();
@@ -30,7 +24,6 @@ pub fn read_wav(path: &Path) -> Result<(Vec<f64>, i32), Box<dyn std::error::Erro
             .collect(),
     };
 
-    // Stereo -> mono by averaging channels
     let mono = if channels > 1 {
         samples_f64
             .chunks(channels)
@@ -127,10 +120,6 @@ pub fn write_wav_stereo(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Channel conversion
-// ---------------------------------------------------------------------------
-
 /// Average multiple channels down to mono.
 pub fn to_mono(channels: &[Vec<f64>]) -> Vec<f64> {
     if channels.is_empty() {
@@ -151,7 +140,7 @@ pub fn mono_to_stereo(mono: &[f64]) -> Vec<Vec<f64>> {
     vec![mono.to_vec(), mono.to_vec()]
 }
 
-/// Ensure at least 2 channels (duplicate mono if needed).
+/// Ensure at least 2 channels, duplicating mono if needed.
 pub fn ensure_stereo(channels: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
     if channels.len() >= 2 {
         channels
@@ -162,11 +151,7 @@ pub fn ensure_stereo(channels: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Resampling (via rubato)
-// ---------------------------------------------------------------------------
-
-/// Resample mono audio from `from_sr` to `to_sr` using high-quality sinc interpolation.
+/// Resample mono audio between sample rates using sinc interpolation.
 pub fn resample(samples: &[f64], from_sr: i32, to_sr: i32) -> Vec<f64> {
     if from_sr == to_sr || samples.is_empty() {
         return samples.to_vec();
@@ -196,7 +181,7 @@ pub fn resample(samples: &[f64], from_sr: i32, to_sr: i32) -> Vec<f64> {
     while pos < samples.len() {
         let end = (pos + chunk_size).min(samples.len());
         let mut chunk = samples[pos..end].to_vec();
-        // Pad last chunk to chunk_size
+        // SincFixedIn requires exactly chunk_size input samples per call
         if chunk.len() < chunk_size {
             chunk.resize(chunk_size, 0.0);
         }
@@ -207,15 +192,10 @@ pub fn resample(samples: &[f64], from_sr: i32, to_sr: i32) -> Vec<f64> {
         pos += chunk_size;
     }
 
-    // Trim to expected length
     let expected = (samples.len() as f64 * ratio) as usize;
     output.truncate(expected);
     output
 }
-
-// ---------------------------------------------------------------------------
-// STFT / iSTFT
-// ---------------------------------------------------------------------------
 
 fn hann_window(size: usize) -> Vec<f64> {
     (0..size)
@@ -225,9 +205,7 @@ fn hann_window(size: usize) -> Vec<f64> {
         .collect()
 }
 
-/// Short-time Fourier Transform.
-///
-/// Returns frames of complex spectra, each with `window_size / 2 + 1` bins.
+/// Short-time Fourier Transform, returning `window_size / 2 + 1` complex bins per frame.
 pub fn stft(samples: &[f64], window_size: usize, hop_size: usize) -> Vec<Vec<Complex64>> {
     let window = hann_window(window_size);
     let mut planner = FftPlanner::<f64>::new();
@@ -235,8 +213,7 @@ pub fn stft(samples: &[f64], window_size: usize, hop_size: usize) -> Vec<Vec<Com
     let n_bins = window_size / 2 + 1;
 
     let mut frames = Vec::new();
-    // Start at -window_size/2 to match librosa center=True behavior:
-    // each frame is centered at pos + window_size/2 = frame_index * hop_size.
+    // Start at -window_size/2 so each frame centers on frame_index * hop_size (matches librosa center=True)
     let mut pos: isize = -(window_size as isize / 2);
 
     while pos < samples.len() as isize {
@@ -260,7 +237,7 @@ pub fn stft(samples: &[f64], window_size: usize, hop_size: usize) -> Vec<Vec<Com
     frames
 }
 
-/// Inverse STFT with overlap-add.
+/// Inverse STFT with overlap-add synthesis.
 pub fn istft(frames: &[Vec<Complex64>], window_size: usize, hop_size: usize) -> Vec<f64> {
     if frames.is_empty() {
         return vec![];
@@ -275,13 +252,12 @@ pub fn istft(frames: &[Vec<Complex64>], window_size: usize, hop_size: usize) -> 
     let mut window_sum = vec![0.0f64; output_len];
 
     for (i, frame) in frames.iter().enumerate() {
-        // Mirror spectrum for full IFFT
+        // Reconstruct full spectrum by mirroring conjugate bins
         let mut buf: Vec<Complex64> = Vec::with_capacity(window_size);
         buf.extend_from_slice(frame);
         for j in (1..window_size / 2).rev() {
             buf.push(frame[j].conj());
         }
-        // Pad if needed
         while buf.len() < window_size {
             buf.push(Complex64::new(0.0, 0.0));
         }
@@ -298,7 +274,6 @@ pub fn istft(frames: &[Vec<Complex64>], window_size: usize, hop_size: usize) -> 
         }
     }
 
-    // Normalize by window overlap
     for i in 0..output_len {
         if window_sum[i] > 1e-8 {
             output[i] /= window_sum[i];
@@ -307,10 +282,6 @@ pub fn istft(frames: &[Vec<Complex64>], window_size: usize, hop_size: usize) -> 
 
     output
 }
-
-// ---------------------------------------------------------------------------
-// Analysis helpers
-// ---------------------------------------------------------------------------
 
 /// Root mean square of a signal.
 pub fn rms(samples: &[f64]) -> f64 {

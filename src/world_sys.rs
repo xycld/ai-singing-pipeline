@@ -1,5 +1,3 @@
-//! Raw FFI bindings for WORLD vocoder C library.
-
 #[repr(C)]
 pub struct HarvestOption {
     pub f0_floor: f64,
@@ -20,7 +18,6 @@ pub struct D4COption {
 }
 
 unsafe extern "C" {
-    // Harvest — F0 estimation
     pub fn InitializeHarvestOption(option: *mut HarvestOption);
     pub fn GetSamplesForHarvest(fs: i32, x_length: i32, frame_period: f64) -> i32;
     pub fn Harvest(
@@ -32,7 +29,6 @@ unsafe extern "C" {
         f0: *mut f64,
     );
 
-    // CheapTrick — spectral envelope
     pub fn InitializeCheapTrickOption(fs: i32, option: *mut CheapTrickOption);
     pub fn GetFFTSizeForCheapTrick(fs: i32, option: *const CheapTrickOption) -> i32;
     pub fn CheapTrick(
@@ -46,7 +42,6 @@ unsafe extern "C" {
         spectrogram: *mut *mut f64,
     );
 
-    // D4C — aperiodicity
     pub fn InitializeD4COption(option: *mut D4COption);
     pub fn D4C(
         x: *const f64,
@@ -60,7 +55,6 @@ unsafe extern "C" {
         aperiodicity: *mut *mut f64,
     );
 
-    // Synthesis
     pub fn Synthesis(
         f0: *const f64,
         f0_length: i32,

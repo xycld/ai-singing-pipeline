@@ -1,9 +1,3 @@
-//! Reverb (Freeverb algorithm) and peak limiter.
-
-// ---------------------------------------------------------------------------
-// Freeverb
-// ---------------------------------------------------------------------------
-
 const COMB_DELAYS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
 const ALLPASS_DELAYS: [usize; 4] = [556, 441, 341, 225];
 const FIXED_GAIN: f64 = 0.015;
@@ -69,6 +63,7 @@ impl AllpassFilter {
     }
 }
 
+/// Freeverb reverb processor.
 pub struct Reverb {
     combs: Vec<CombFilter>,
     allpasses: Vec<AllpassFilter>,
@@ -77,15 +72,11 @@ pub struct Reverb {
 }
 
 impl Reverb {
-    /// Create a Freeverb instance.
-    ///
-    /// - `room_size` 0.0–1.0 (scales feedback)
-    /// - `wet` / `dry` mix levels
+    /// Create a Freeverb instance with room size (0.0--1.0) and wet/dry mix.
     pub fn new(sr: f64, room_size: f64, wet: f64, dry: f64) -> Self {
-        // Scale delays for sample rates other than 44100
         let scale = sr / 44100.0;
         let damping = 0.5;
-        let feedback = 0.28 + room_size * 0.7; // map 0..1 → 0.28..0.98
+        let feedback = 0.28 + room_size * 0.7;
 
         let mut combs: Vec<CombFilter> = COMB_DELAYS
             .iter()
@@ -98,7 +89,7 @@ impl Reverb {
             })
             .collect();
 
-        // Slightly detune odd combs for stereo-ish width even in mono
+        // Detune odd combs slightly for stereo-ish width in mono
         for (i, c) in combs.iter_mut().enumerate() {
             if i % 2 == 1 {
                 c.set_feedback(feedback * 0.98);
@@ -121,17 +112,16 @@ impl Reverb {
         }
     }
 
+    /// Apply reverb in-place.
     pub fn process_mono(&mut self, samples: &mut [f64]) {
         for s in samples.iter_mut() {
             let input = *s * FIXED_GAIN;
 
-            // Parallel comb filters
             let mut comb_sum = 0.0;
             for comb in self.combs.iter_mut() {
                 comb_sum += comb.process(input);
             }
 
-            // Series allpass filters
             let mut out = comb_sum;
             for ap in self.allpasses.iter_mut() {
                 out = ap.process(out);
@@ -142,15 +132,7 @@ impl Reverb {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Peak limiter (mastering-style)
-// ---------------------------------------------------------------------------
-//
-// Fast envelope follower with soft-knee gain reduction, matching the
-// behaviour of Pedalboard/JUCE limiters used in the Python reference.
-// Only reduces gain around peaks that exceed the threshold — preserves
-// overall loudness and dynamics.
-
+/// Peak limiter with fast attack envelope follower.
 pub struct Limiter {
     threshold: f64,
     attack_coeff: f64,
@@ -170,25 +152,23 @@ impl Limiter {
         }
     }
 
+    /// Limit peaks exceeding threshold, with hard ceiling safety clamp.
     pub fn process_mono(&mut self, samples: &mut [f64]) {
         let threshold = self.threshold;
 
         for s in samples.iter_mut() {
             let abs = s.abs();
 
-            // Envelope follower: fast attack, moderate release
             if abs > self.env {
                 self.env = self.attack_coeff * self.env + (1.0 - self.attack_coeff) * abs;
             } else {
                 self.env = self.release_coeff * self.env + (1.0 - self.release_coeff) * abs;
             }
 
-            // Apply gain reduction only when envelope exceeds threshold
             if self.env > threshold {
                 *s *= threshold / self.env;
             }
 
-            // Hard ceiling as safety net
             *s = s.clamp(-threshold, threshold);
         }
     }

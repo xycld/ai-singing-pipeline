@@ -1,10 +1,7 @@
-//! Safe Rust wrappers around WORLD vocoder FFI.
-
 use crate::world_sys;
 use std::alloc::{self, Layout};
 
-/// F0 estimation via Harvest algorithm.
-/// Returns (temporal_positions, f0).
+/// F0 estimation via Harvest. Returns (temporal_positions, f0).
 pub fn harvest(audio: &[f64], fs: i32, frame_period: f64) -> (Vec<f64>, Vec<f64>) {
     let x_length = audio.len() as i32;
     let n_frames =
@@ -31,8 +28,7 @@ pub fn harvest(audio: &[f64], fs: i32, frame_period: f64) -> (Vec<f64>, Vec<f64>
     (times, f0)
 }
 
-/// Spectral envelope estimation via CheapTrick.
-/// Returns (spectrogram as Vec<Vec<f64>>, fft_size).
+/// Spectral envelope via CheapTrick. Returns (spectrogram, fft_size).
 pub fn cheaptrick(
     audio: &[f64],
     fs: i32,
@@ -50,7 +46,6 @@ pub fn cheaptrick(
     let spec_len = (fft_size / 2 + 1) as usize;
     let n_frames = f0.len();
 
-    // Allocate 2D array: array of row pointers, each row is spec_len doubles
     let mut row_ptrs = alloc_2d(n_frames, spec_len);
 
     unsafe {
@@ -120,7 +115,6 @@ pub fn synthesis(
     fs: i32,
 ) -> Vec<f64> {
     let f0_length = f0.len() as i32;
-    // Output length: same formula WORLD uses internally
     let y_length = ((f0.len() as f64 - 1.0) * frame_period * fs as f64 / 1000.0) as i32 + 1;
 
     let spec_ptrs: Vec<*const f64> = spectrogram.iter().map(|row| row.as_ptr()).collect();
@@ -145,8 +139,7 @@ pub fn synthesis(
     y
 }
 
-// --- 2D allocation helpers for C interop ---
-
+// WORLD's C API requires caller-allocated 2D arrays of raw pointers
 fn alloc_2d(rows: usize, cols: usize) -> Vec<*mut f64> {
     let mut ptrs = Vec::with_capacity(rows);
     let layout = Layout::array::<f64>(cols).unwrap();

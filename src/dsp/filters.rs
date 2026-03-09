@@ -1,9 +1,6 @@
-//! Biquad IIR filters (Audio EQ Cookbook — Robert Bristow-Johnson).
-//!
-//! Direct Form II Transposed implementation for numerical stability.
-
 use std::f64::consts::PI;
 
+/// Biquad IIR filter (Direct Form II Transposed).
 pub struct Biquad {
     b0: f64,
     b1: f64,
@@ -20,7 +17,8 @@ impl Biquad {
         let w0 = 2.0 * PI * cutoff / sr;
         let cos_w0 = w0.cos();
         let sin_w0 = w0.sin();
-        let alpha = sin_w0 / (2.0 * 2.0_f64.sqrt()); // Q = 1/sqrt(2) for Butterworth
+        // Q = 1/sqrt(2) for Butterworth
+        let alpha = sin_w0 / (2.0 * 2.0_f64.sqrt());
 
         let b0 = (1.0 + cos_w0) / 2.0;
         let b1 = -(1.0 + cos_w0);
@@ -32,13 +30,12 @@ impl Biquad {
         Self::from_coeffs(b0, b1, b2, a0, a1, a2)
     }
 
-    /// High-shelf filter. `gain_db` positive boosts, negative cuts.
+    /// High-shelf filter. Positive `gain_db` boosts, negative cuts.
     pub fn high_shelf(sr: f64, freq: f64, gain_db: f64) -> Self {
         let a_lin = 10.0_f64.powf(gain_db / 40.0);
         let w0 = 2.0 * PI * freq / sr;
         let cos_w0 = w0.cos();
         let sin_w0 = w0.sin();
-        // S=1 slope simplifies to: alpha = sin(w0)/2 * sqrt(2)
         let alpha = sin_w0 / 2.0 * 2.0_f64.sqrt();
         let two_sqrt_a_alpha = 2.0 * a_lin.sqrt() * alpha;
 
@@ -82,6 +79,7 @@ impl Biquad {
         }
     }
 
+    /// Filter samples in-place.
     pub fn process_mono(&mut self, samples: &mut [f64]) {
         for s in samples.iter_mut() {
             let x = *s;
@@ -92,6 +90,7 @@ impl Biquad {
         }
     }
 
+    /// Reset filter state to zero.
     pub fn reset(&mut self) {
         self.z1 = 0.0;
         self.z2 = 0.0;

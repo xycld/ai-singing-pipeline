@@ -1,18 +1,3 @@
-//! AI singing vocal post-processing pipeline.
-//!
-//! Four-stage pipeline: **denoise** -> **align** -> **pitch correct** -> **mix**.
-//!
-//! Each stage can be used independently or chained via [`Pipeline`].
-//!
-//! # Quick start
-//!
-//! ```no_run
-//! use ai_singing_pipeline::{Pipeline, PipelineConfig};
-//!
-//! let pipeline = Pipeline::new(PipelineConfig::default());
-//! pipeline.run("raw.wav", "ref_vocals.wav", "instrumental.wav", "output.wav").unwrap();
-//! ```
-
 pub mod align;
 pub mod audio;
 pub mod denoise;
@@ -24,7 +9,6 @@ pub(crate) mod world_sys;
 
 use std::path::{Path, PathBuf};
 
-// Re-exports for convenience
 pub use align::AlignConfig;
 pub use denoise::DenoiseConfig;
 pub use mix::MixConfig;
@@ -105,10 +89,7 @@ impl Default for PipelineConfig {
     }
 }
 
-/// Pipeline orchestrator.
-///
-/// Chains denoise -> align -> pitch correct -> mix, with optional
-/// progress callbacks and individual stage access.
+/// Chains denoise -> align -> pitch correct -> mix.
 pub struct Pipeline {
     config: PipelineConfig,
     progress: Option<Box<dyn Fn(Stage, f32) + Send + Sync>>,
@@ -135,11 +116,6 @@ impl Pipeline {
     }
 
     /// Run the full pipeline: denoise -> align -> pitch correct -> mix.
-    ///
-    /// - `user_wav`: raw user vocal recording
-    /// - `ref_wav`: reference vocal (clean, time-aligned original)
-    /// - `inst_wav`: instrumental / backing track
-    /// - `output_wav`: final mixed output path
     pub fn run(
         &self,
         user_wav: impl AsRef<Path>,
@@ -154,7 +130,6 @@ impl Pipeline {
 
         let tmp_dir = std::env::temp_dir();
 
-        // Stage 1: Denoise (optional)
         let denoised_path;
         if let Some(denoise_config) = &self.config.denoise {
             self.report(Stage::Denoise, 0.0);
@@ -165,7 +140,6 @@ impl Pipeline {
             denoised_path = user_wav.to_path_buf();
         }
 
-        // Stage 2: Align
         self.report(Stage::Align, 0.0);
         let aligned_path = tmp_dir.join("_pipeline_aligned.wav");
         align::process_align(
@@ -177,14 +151,12 @@ impl Pipeline {
         )?;
         self.report(Stage::Align, 1.0);
 
-        // Stage 3: Pitch correct
         self.report(Stage::PitchCorrect, 0.0);
         let corrected_path = tmp_dir.join("_pipeline_corrected.wav");
         let corrector = PitchCorrector::from_config(self.config.pitch_correct.clone());
         let _stats = corrector.process(&aligned_path, ref_wav, &corrected_path)?;
         self.report(Stage::PitchCorrect, 1.0);
 
-        // Stage 4: Mix
         self.report(Stage::Mix, 0.0);
         mix::process_mix(
             &corrected_path,
@@ -195,15 +167,12 @@ impl Pipeline {
         )?;
         self.report(Stage::Mix, 1.0);
 
-        // Cleanup temp files
         let _ = std::fs::remove_file(&tmp_dir.join("_pipeline_denoised.wav"));
         let _ = std::fs::remove_file(&aligned_path);
         let _ = std::fs::remove_file(&corrected_path);
 
         Ok(())
     }
-
-    // --- Individual stage methods ---
 
     /// Run only the denoise stage.
     pub fn denoise(&self, input: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<()> {

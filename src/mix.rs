@@ -1,13 +1,8 @@
-//! Reference-guided mixing — port of mixing.py.
-//!
-//! Analyzes a reference vocal's loudness/brightness, then applies an adaptive
-//! FX chain (gate, HPF, EQ, compressor, reverb) and auto-levels to match.
-
 use crate::dsp::{Biquad, Compressor, Gate, Limiter, Reverb};
 use crate::{audio, Error, Result};
 use std::path::Path;
 
-/// Configuration for the mixing stage.
+/// Mixing stage configuration.
 #[derive(Debug, Clone)]
 pub struct MixConfig {
     pub enable_emotion: bool,
@@ -23,19 +18,12 @@ impl Default for MixConfig {
     }
 }
 
-/// Reference analysis results.
 struct ReferenceAnalysis {
     target_balance_db: f64,
     target_brightness: f64,
 }
 
-/// Run the full mixing pipeline.
-///
-/// Produces up to 4 output files:
-/// - `output_path`: user vocal + instrumental
-/// - `*_vocal.wav`: processed vocal only
-/// - `*_with_ref.wav`: user + reference (no instrumental)
-/// - `*_plus_ref.wav`: user + instrumental + reference(-6dB)
+/// Run the full mixing pipeline, producing vocal, main mix, and comparison outputs.
 pub fn process_mix(
     user_path: &Path,
     inst_path: &Path,
@@ -43,24 +31,20 @@ pub fn process_mix(
     output_path: &Path,
     config: &MixConfig,
 ) -> Result<()> {
-    // 1. Analyze reference vocal vs instrumental for target balance/brightness
     eprintln!("1. Analyzing reference...");
     let analysis = analyze_reference(ref_path, inst_path)?;
 
-    // 2. Load user vocal
     eprintln!("2. Loading and processing user vocal...");
     let (user_channels, user_sr) =
         audio::read_wav_stereo(user_path).map_err(|e| Error::Audio(e.to_string()))?;
     let mut user_channels = audio::ensure_stereo(user_channels);
 
-    // 2.0 Emotion alignment: match RMS envelope to reference
     if config.enable_emotion {
         let (ref_channels, ref_sr) =
             audio::read_wav_stereo(ref_path).map_err(|e| Error::Audio(e.to_string()))?;
         let mut ref_channels = audio::ensure_stereo(ref_channels);
         clamp_channels(&mut ref_channels);
 
-        // Resample reference if needed
         if ref_sr != user_sr {
             for ch in ref_channels.iter_mut() {
                 *ch = audio::resample(ch, ref_sr, user_sr);
@@ -75,11 +59,9 @@ pub fn process_mix(
         );
     }
 
-    // 2.1 Compute user loudness (mono) for adaptive FX thresholds
     let user_mono = audio::to_mono(&user_channels);
     let user_db = audio::rms_db(&user_mono);
 
-    // 2.2 Build and apply smart FX chain
     let user_brightness = audio::spectral_centroid(&user_mono, user_sr);
     eprintln!("   User brightness: {:.0} Hz", user_brightness);
 
@@ -92,7 +74,6 @@ pub fn process_mix(
         user_db,
     );
 
-    // 2.3 Auto-level: match processed vocal to target balance
     let (inst_channels, inst_sr) =
         audio::read_wav_stereo(inst_path).map_err(|e| Error::Audio(e.to_string()))?;
     let mut inst_channels = audio::ensure_stereo(inst_channels);
@@ -118,20 +99,17 @@ pub fn process_mix(
         gain_needed_db
     );
 
-    // Apply final gain
     for ch in processed_channels.iter_mut() {
         for s in ch.iter_mut() {
             *s *= gain_linear;
         }
     }
 
-    // 3. Mix and output
     eprintln!("3. Mixing...");
     let min_len = processed_channels[0]
         .len()
         .min(inst_channels[0].len());
 
-    // Trim to common length
     for ch in processed_channels.iter_mut() {
         ch.truncate(min_len);
     }
@@ -141,7 +119,6 @@ pub fn process_mix(
 
     let mut limiter;
 
-    // 3.1 Vocal only
     let mut vocal_only = processed_channels.clone();
     for ch in vocal_only.iter_mut() {
         limiter = Limiter::new(user_sr as f64, -1.0);
@@ -152,7 +129,6 @@ pub fn process_mix(
         .map_err(|e| Error::Audio(e.to_string()))?;
     eprintln!("   Vocal only -> {}", vocal_path.display());
 
-    // 3.2 Main mix: user + instrumental
     let mix_channels = add_channels(&processed_channels, &inst_channels);
     let mut final_mix = mix_channels;
     for ch in final_mix.iter_mut() {
@@ -163,7 +139,6 @@ pub fn process_mix(
         .map_err(|e| Error::Audio(e.to_string()))?;
     eprintln!("   Mix -> {}", output_path.display());
 
-    // 3.3 Comparison outputs (user + ref, guide mix)
     if let Ok((ref_ch, ref_sr)) = audio::read_wav_stereo(ref_path) {
         let mut ref_ch = audio::ensure_stereo(ref_ch);
         clamp_channels(&mut ref_ch);
@@ -174,11 +149,9 @@ pub fn process_mix(
         }
         for ch in ref_ch.iter_mut() {
             ch.truncate(min_len);
-            // Pad if shorter
             ch.resize(min_len, 0.0);
         }
 
-        // User + reference (no instrumental)
         let user_ref = add_channels(&processed_channels, &ref_ch);
         let mut user_ref_limited = user_ref;
         for ch in user_ref_limited.iter_mut() {
@@ -190,7 +163,7 @@ pub fn process_mix(
             .map_err(|e| Error::Audio(e.to_string()))?;
         eprintln!("   With ref -> {}", with_ref_path.display());
 
-        // Guide mix: user + instrumental + reference(-6dB)
+        // -6dB (~0.5 linear) so reference sits behind the user vocal
         let ref_quiet: Vec<Vec<f64>> = ref_ch
             .iter()
             .map(|ch| ch.iter().map(|&s| s * 0.5).collect())
@@ -211,7 +184,7 @@ pub fn process_mix(
     Ok(())
 }
 
-/// Clamp channels to ±1.0 (Demucs float outputs can have rare spikes beyond this).
+// Demucs float outputs can spike beyond +/-1.0
 fn clamp_channels(channels: &mut [Vec<f64>]) {
     for ch in channels.iter_mut() {
         for s in ch.iter_mut() {
@@ -226,7 +199,6 @@ fn clamp_mono(samples: &mut Vec<f64>) {
     }
 }
 
-/// Analyze reference vocal and instrumental to extract target mixing parameters.
 fn analyze_reference(ref_path: &Path, inst_path: &Path) -> Result<ReferenceAnalysis> {
     let (mut ref_mono, ref_sr) =
         audio::read_wav(ref_path).map_err(|e| Error::Audio(e.to_string()))?;
@@ -253,7 +225,6 @@ fn analyze_reference(ref_path: &Path, inst_path: &Path) -> Result<ReferenceAnaly
     })
 }
 
-/// Match RMS envelope of user to reference for consistent dynamics.
 fn apply_emotion_alignment(
     user_channels: &[Vec<f64>],
     ref_channels: &[Vec<f64>],
@@ -282,7 +253,7 @@ fn apply_emotion_alignment(
     let ref_rms = audio::smooth(&ref_rms[..min_frames], 5);
     let user_rms = audio::smooth(&user_rms[..min_frames], 5);
 
-    // Compute per-frame gain in dB, clamped to +-9dB
+    // Clamp to +/-9dB to avoid pumping artifacts on quiet passages
     let gain_db: Vec<f64> = ref_rms
         .iter()
         .zip(user_rms.iter())
@@ -295,7 +266,6 @@ fn apply_emotion_alignment(
 
     let gain_linear: Vec<f64> = gain_db.iter().map(|&db| 10.0_f64.powf(db / 20.0)).collect();
 
-    // Interpolate gain curve to sample level
     let n_samples = user_channels[0].len();
     let frame_positions: Vec<f64> = (0..min_frames).map(|i| (i * hop_length) as f64).collect();
 
@@ -307,7 +277,6 @@ fn apply_emotion_alignment(
         gain_db.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
     );
 
-    // Apply gain to all channels
     user_channels
         .iter()
         .map(|ch| {
@@ -319,7 +288,6 @@ fn apply_emotion_alignment(
         .collect()
 }
 
-/// Apply the smart FX chain: Gate -> HPF -> HighShelf EQ -> Peak EQ -> Compressor -> Reverb.
 fn apply_smart_chain(
     channels: &mut [Vec<f64>],
     sr: i32,
@@ -329,7 +297,6 @@ fn apply_smart_chain(
 ) {
     let sr_f = sr as f64;
 
-    // Compute adaptive parameters
     let brightness_diff = target_brightness - user_brightness;
     let high_shelf_gain = (brightness_diff / 500.0).clamp(-4.0, 6.0);
     let comp_threshold = (-40.0_f64).max(vocal_rms_db - 8.0);
@@ -338,39 +305,29 @@ fn apply_smart_chain(
     eprintln!("   Auto EQ: HighShelf {:+.1}dB", high_shelf_gain);
 
     for ch in channels.iter_mut() {
-        // 1. Noise gate
         let mut gate = Gate::new(sr_f, gate_threshold, 4.0, 200.0);
         gate.process_mono(ch);
 
-        // 2. High-pass filter at 80Hz
         let mut hpf = Biquad::highpass(sr_f, 80.0);
         hpf.process_mono(ch);
 
-        // 3. High-shelf EQ for brightness matching
         if high_shelf_gain.abs() > 0.1 {
             let mut shelf = Biquad::high_shelf(sr_f, 8000.0, high_shelf_gain);
             shelf.process_mono(ch);
         }
 
-        // 4. Peak EQ: reduce muddiness at 400Hz
+        // Cut 400Hz mud that builds up from close-mic recording
         let mut peak = Biquad::peak_eq(sr_f, 400.0, -2.5, 1.0);
         peak.process_mono(ch);
 
-        // 5. Compressor
         let mut comp = Compressor::new(sr_f, comp_threshold, 2.5, 10.0, 100.0);
         comp.process_mono(ch);
 
-        // 6. Reverb
         let mut reverb = Reverb::new(sr_f, 0.5, 0.2, 0.8);
         reverb.process_mono(ch);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Add two multi-channel signals sample-by-sample.
 fn add_channels(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let n_ch = a.len().min(b.len());
     (0..n_ch)
@@ -381,7 +338,6 @@ fn add_channels(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
         .collect()
 }
 
-/// Linear interpolation of frame-rate values to sample-rate.
 fn interpolate_linear(positions: &[f64], values: &[f64], n_samples: usize) -> Vec<f64> {
     if values.is_empty() {
         return vec![1.0; n_samples];
@@ -402,7 +358,6 @@ fn interpolate_linear(positions: &[f64], values: &[f64], n_samples: usize) -> Ve
         } else if x >= last_pos {
             out.push(last_val);
         } else {
-            // Binary search for interval
             let mut lo = 0;
             let mut hi = positions.len() - 1;
             while lo + 1 < hi {
@@ -420,7 +375,6 @@ fn interpolate_linear(positions: &[f64], values: &[f64], n_samples: usize) -> Ve
     out
 }
 
-/// Generate a path with a suffix before the extension.
 fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let ext = path.extension().unwrap_or_default().to_string_lossy();

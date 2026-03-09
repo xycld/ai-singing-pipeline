@@ -1,19 +1,14 @@
-//! Reference-guided pitch correction.
-//!
-//! Compares a user vocal against a reference melody and corrects pitch using
-//! one of several backends: Praat PSOLA, WORLD vocoder, Signalsmith Stretch, or TD-PSOLA.
-
 use crate::{audio, world, Error, Result};
 use std::path::{Path, PathBuf};
 
 /// Pitch correction backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
-    /// Praat PSOLA via CLI subprocess — best quality, no GPL infection.
+    /// Praat PSOLA via CLI subprocess.
     Praat,
-    /// WORLD vocoder — full spectral decomposition/resynthesis.
+    /// WORLD vocoder spectral resynthesis.
     World,
-    /// Signalsmith Stretch — spectral phase-vocoder pitch shifting.
+    /// Signalsmith Stretch phase-vocoder.
     Signalsmith,
     /// TD-PSOLA with variable wavelength tracking.
     Tdpsola,
@@ -274,10 +269,6 @@ pub struct CorrectionResult {
     pub median_correction_cents: f64,
 }
 
-// ---------------------------------------------------------------------------
-// F0 analysis + per-method synthesis (from correct.rs)
-// ---------------------------------------------------------------------------
-
 pub struct FrameCorrections {
     pub f0_user: Vec<f64>,
     pub f0_corrected: Vec<f64>,
@@ -335,6 +326,7 @@ pub fn analyze_corrections(
         let st_u = hz_to_semitone(fu);
         let mut st_r = hz_to_semitone(fr);
 
+        // Snap to nearest octave to avoid overcorrecting octave-detection errors
         let diff = st_r - st_u;
         if diff.abs() > 6.0 {
             st_r -= 12.0 * (diff / 12.0).round();
@@ -360,6 +352,7 @@ pub fn analyze_corrections(
 
     smooth_f0_voiced(&mut f0_corrected, 11);
 
+    // Recompute shifts after smoothing since smoothing may have changed f0_corrected
     for i in 0..f0_u.len() {
         if f0_u[i] > 0.0 && f0_corrected[i] > 0.0 {
             shift_st[i] = hz_to_semitone(f0_corrected[i]) - hz_to_semitone(f0_u[i]);
@@ -506,6 +499,7 @@ impl tdpsola::AlternatingWindow for VariableHann {
         self.c = self.c * self.c_delta - s * self.s_delta;
         self.s_square = self.s * self.s;
         self.c_square = self.c * self.c;
+        // Renormalize to prevent drift from accumulated floating-point error
         let factor = (3.0 - self.s_square - self.c_square) / 2.0;
         self.s *= factor;
         self.c *= factor;

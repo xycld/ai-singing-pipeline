@@ -1,18 +1,9 @@
-//! Time-alignment via chroma features + DTW + WSOLA.
-//!
-//! Port of align.py: extracts chroma features, runs band-constrained DTW,
-//! evaluates onset correlation, then either applies a global shift (Strategy A)
-//! or time-stretches via built-in WSOLA (Strategy B).
-
 use crate::{audio, dsp, Error, Result};
 use std::path::Path;
 
-/// Internal sample rate for alignment processing (matches librosa default).
 const FS: i32 = 22050;
-/// Chroma feature rate in Hz.
 const FEATURE_RATE: usize = 50;
 
-/// Configuration for the alignment stage.
 #[derive(Debug, Clone)]
 pub struct AlignConfig {
     pub safe_mode: bool,
@@ -24,7 +15,7 @@ impl Default for AlignConfig {
     }
 }
 
-/// Run time-alignment: load user + ref, align, write output.
+/// Load user and reference audio, time-align, and write the result.
 pub fn process_align(
     user_path: &Path,
     ref_path: &Path,
@@ -32,7 +23,6 @@ pub fn process_align(
     output_sr: i32,
     config: &AlignConfig,
 ) -> Result<()> {
-    // 1. Load and resample to 22050 Hz for analysis
     eprintln!("1. Loading audio ({} Hz)...", FS);
     let (user_orig, user_sr) =
         audio::read_wav(user_path).map_err(|e| Error::Audio(e.to_string()))?;
@@ -56,7 +46,6 @@ pub fn process_align(
         audio_ref.len() as f64 / FS as f64,
     );
 
-    // 2. Extract chroma features
     eprintln!("2. Extracting chroma features...");
     let chroma_user = extract_chroma(&audio_user, FS, FEATURE_RATE);
     let chroma_ref = extract_chroma(&audio_ref, FS, FEATURE_RATE);
@@ -66,14 +55,12 @@ pub fn process_align(
         chroma_ref.len()
     );
 
-    // 3. DTW alignment
     eprintln!("3. DTW alignment...");
     let step_weights = [1.5, 1.5, 2.0];
-    let band_width = (10.0 * FEATURE_RATE as f64) as usize; // 10s band
+    let band_width = (10.0 * FEATURE_RATE as f64) as usize;
     let wp = dtw_band(&chroma_user, &chroma_ref, &step_weights, band_width);
     eprintln!("   Path length: {}", wp.len());
 
-    // Convert warping path to sample positions
     let time_map: Vec<(f64, f64)> = wp
         .iter()
         .map(|&(i, j)| {
@@ -85,7 +72,6 @@ pub fn process_align(
 
     let target_len = audio_ref.len();
 
-    // 4. Adaptive alignment: onset cross-correlation to choose strategy
     eprintln!("4. Adaptive alignment...");
     let eval_hop = 256;
     let o_user = audio::onset_strength(&audio_user, FS, eval_hop);
@@ -102,8 +88,7 @@ pub fn process_align(
         let a = &o_ref[s..s + win_eval];
         let b = &o_user[s..s + win_eval];
         if let Some(best_lag) = cross_correlate_peak(a, b, max_lag_eval) {
-            // Negate: our correlate convention is opposite to scipy's.
-            // Positive best_lag means user is ahead of ref, needs negative shift.
+            // Negate: our cross-correlation convention is opposite to scipy's
             segment_lags.push(-best_lag as f64 * eval_hop as f64 / FS as f64);
         }
         s += hop_eval;
@@ -124,14 +109,12 @@ pub fn process_align(
     eprintln!("   Aligned segments: {:.0}% (residual <200ms)", pct_good);
 
     let y_aligned = if pct_good >= 75.0 {
-        // Strategy A: global shift only — zero time-stretch
         eprintln!("   -> Strategy A: global shift {:+.3}s", median_offset);
         let shift_samples = (median_offset * FS as f64).round() as isize;
         apply_global_shift(&audio_user, shift_samples)
     } else {
-        // Strategy B: SmartAlign + WSOLA
         eprintln!("   -> Strategy B: SmartAlign + WSOLA");
-        let step_b = FEATURE_RATE / 2; // ~2 anchors/second
+        let step_b = FEATURE_RATE / 2;
         let lo = (0.12 * FS as f64) as f64;
         let hi = (0.40 * FS as f64) as f64;
 
@@ -141,7 +124,7 @@ pub fn process_align(
 
         let anchor_indices: Vec<usize> = (0..time_map.len())
             .step_by(step_b.max(1))
-            .skip(1) // skip first
+            .skip(1)
             .collect();
 
         for &idx in &anchor_indices {
@@ -151,6 +134,7 @@ pub fn process_align(
             let (src, dtw_tgt) = time_map[idx];
             let offset = (src - dtw_tgt).abs();
 
+            // Blend between identity and DTW target based on offset magnitude
             let alpha = if offset <= lo {
                 0.0
             } else if offset >= hi {
@@ -175,7 +159,6 @@ pub fn process_align(
         dsp::timemap_stretch(&audio_user, &timemap)
     };
 
-    // 5. Length matching
     let mut y_aligned = y_aligned;
     if y_aligned.len() > target_len {
         y_aligned.truncate(target_len);
@@ -183,7 +166,6 @@ pub fn process_align(
         y_aligned.resize(target_len, 0.0);
     }
 
-    // 6. Evaluation
     if config.safe_mode {
         let mut base = audio_user.clone();
         base.resize(target_len, 0.0);
@@ -197,7 +179,6 @@ pub fn process_align(
         );
     }
 
-    // 7. Resample to output SR + save
     let y_out = if output_sr != FS {
         eprintln!("5. Resampling {} -> {} Hz...", FS, output_sr);
         audio::resample(&y_aligned, FS, output_sr)
@@ -209,7 +190,6 @@ pub fn process_align(
         .map_err(|e| Error::Audio(e.to_string()))?;
     eprintln!("Alignment done! -> {}", output_path.display());
 
-    // Verification mix: user_aligned + ref * 0.15
     let audio_ref_out = if output_sr != FS {
         audio::resample(&audio_ref, FS, output_sr)
     } else {
@@ -246,11 +226,6 @@ pub fn process_align(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Chroma feature extraction
-// ---------------------------------------------------------------------------
-
-/// Extract chroma features (12 pitch classes) at the given feature rate.
 fn extract_chroma(samples: &[f64], sr: i32, feature_rate: usize) -> Vec<[f64; 12]> {
     let hop_size = sr as usize / feature_rate;
     let window_size = 4096;
@@ -266,13 +241,11 @@ fn extract_chroma(samples: &[f64], sr: i32, feature_rate: usize) -> Vec<[f64; 12
                 if freq < 50.0 || freq > 5000.0 {
                     continue;
                 }
-                // Map frequency to pitch class (MIDI note mod 12)
                 let midi = 69.0 + 12.0 * (freq / 440.0).log2();
                 let pitch_class = ((midi.round() as i32 % 12 + 12) % 12) as usize;
                 let mag = c.norm();
                 chroma[pitch_class] += mag * mag;
             }
-            // L2 normalize
             let norm = chroma.iter().sum::<f64>().sqrt();
             if norm > 1e-10 {
                 for v in chroma.iter_mut() {
@@ -284,11 +257,6 @@ fn extract_chroma(samples: &[f64], sr: i32, feature_rate: usize) -> Vec<[f64; 12
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Band-constrained DTW
-// ---------------------------------------------------------------------------
-
-/// Cosine distance between two chroma vectors.
 fn chroma_distance(a: &[f64; 12], b: &[f64; 12]) -> f64 {
     let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -299,9 +267,6 @@ fn chroma_distance(a: &[f64; 12], b: &[f64; 12]) -> f64 {
     1.0 - dot / (na * nb)
 }
 
-/// Band-constrained DTW with step weights.
-///
-/// Returns the warping path as (user_frame, ref_frame) pairs, sorted ascending.
 fn dtw_band(
     features_a: &[[f64; 12]],
     features_b: &[[f64; 12]],
@@ -314,9 +279,8 @@ fn dtw_band(
         return vec![];
     }
 
-    // Use a banded cost matrix to reduce memory: store only band_width*2+1 columns per row.
-    // For simplicity with moderate sizes, use full matrix if feasible, else banded.
-    let use_full = (n as u64) * (m as u64) < 100_000_000; // ~800MB limit
+    // Full matrix for small inputs; banded for large to avoid ~800MB+ allocations
+    let use_full = (n as u64) * (m as u64) < 100_000_000;
 
     if use_full {
         dtw_full(features_a, features_b, step_weights)
@@ -334,11 +298,9 @@ fn dtw_full(
     let m = b.len();
     let inf = f64::INFINITY;
 
-    // Cost matrix
     let mut d = vec![vec![inf; m]; n];
     d[0][0] = chroma_distance(&a[0], &b[0]);
 
-    // Fill first row and column
     for j in 1..m {
         d[0][j] = d[0][j - 1] + chroma_distance(&a[0], &b[j]) * w[1];
     }
@@ -346,18 +308,16 @@ fn dtw_full(
         d[i][0] = d[i - 1][0] + chroma_distance(&a[i], &b[0]) * w[0];
     }
 
-    // Fill rest
     for i in 1..n {
         for j in 1..m {
             let cost = chroma_distance(&a[i], &b[j]);
-            let c1 = d[i - 1][j] + cost * w[0]; // vertical step
-            let c2 = d[i][j - 1] + cost * w[1]; // horizontal step
-            let c3 = d[i - 1][j - 1] + cost * w[2]; // diagonal step
+            let c1 = d[i - 1][j] + cost * w[0];
+            let c2 = d[i][j - 1] + cost * w[1];
+            let c3 = d[i - 1][j - 1] + cost * w[2];
             d[i][j] = c1.min(c2).min(c3);
         }
     }
 
-    // Backtrack
     backtrack(&d, n, m)
 }
 
@@ -372,12 +332,10 @@ fn dtw_banded(
     let inf = f64::INFINITY;
     let bw = band.max(1);
 
-    // For banded DTW, we store a strip of width 2*bw+1 per row
     let strip_w = 2 * bw + 1;
     let mut d = vec![vec![inf; strip_w]; n];
 
-    // Map (i, j) -> strip index: j_local = j - (j_center - bw)
-    // where j_center = i * m / n (diagonal)
+    // Map global column j to local strip index relative to the diagonal band center
     let j_center = |i: usize| -> usize { (i as u64 * m as u64 / n as u64) as usize };
     let j_range = |i: usize| -> (usize, usize) {
         let center = j_center(i);
@@ -394,12 +352,10 @@ fn dtw_banded(
         }
     };
 
-    // Initialize (0, 0)
     if let Some(jl) = to_local(0, 0) {
         d[0][jl] = chroma_distance(&a[0], &b[0]);
     }
 
-    // Fill
     for i in 0..n {
         let (jlo, jhi) = j_range(i);
         for j in jlo..=jhi {
@@ -410,19 +366,16 @@ fn dtw_banded(
             let cost = chroma_distance(&a[i], &b[j]);
 
             let mut best = inf;
-            // Vertical: (i-1, j)
             if i > 0 {
                 if let Some(pjl) = to_local(i - 1, j) {
                     best = best.min(d[i - 1][pjl] + cost * w[0]);
                 }
             }
-            // Horizontal: (i, j-1)
             if j > 0 {
                 if let Some(pjl) = to_local(i, j - 1) {
                     best = best.min(d[i][pjl] + cost * w[1]);
                 }
             }
-            // Diagonal: (i-1, j-1)
             if i > 0 && j > 0 {
                 if let Some(pjl) = to_local(i - 1, j - 1) {
                     best = best.min(d[i - 1][pjl] + cost * w[2]);
@@ -433,7 +386,6 @@ fn dtw_banded(
         }
     }
 
-    // Backtrack through banded matrix
     let mut path = Vec::new();
     let mut i = n - 1;
     let mut j = m - 1;
@@ -508,11 +460,6 @@ fn backtrack(d: &[Vec<f64>], n: usize, m: usize) -> Vec<(usize, usize)> {
     path
 }
 
-// ---------------------------------------------------------------------------
-// Onset cross-correlation
-// ---------------------------------------------------------------------------
-
-/// Find the lag (in frames) that maximizes cross-correlation between two signals.
 fn cross_correlate_peak(a: &[f64], b: &[f64], max_lag: usize) -> Option<isize> {
     if a.is_empty() || b.is_empty() {
         return None;
@@ -541,7 +488,6 @@ fn cross_correlate_peak(a: &[f64], b: &[f64], max_lag: usize) -> Option<isize> {
     Some(best_lag)
 }
 
-/// Alignment score: mean absolute onset lag across sliding windows.
 fn alignment_score(y_test: &[f64], y_ref: &[f64], hop: usize) -> f64 {
     let o_test = audio::onset_strength(y_test, FS, hop);
     let o_ref = audio::onset_strength(y_ref, FS, hop);
@@ -576,11 +522,6 @@ fn alignment_score(y_test: &[f64], y_ref: &[f64], hop: usize) -> f64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Time-stretching helpers
-// ---------------------------------------------------------------------------
-
-/// Apply a simple global sample shift (Strategy A).
 fn apply_global_shift(audio: &[f64], shift_samples: isize) -> Vec<f64> {
     if shift_samples > 0 {
         let mut out = vec![0.0; shift_samples as usize];
@@ -597,4 +538,3 @@ fn apply_global_shift(audio: &[f64], shift_samples: isize) -> Vec<f64> {
         audio.to_vec()
     }
 }
-

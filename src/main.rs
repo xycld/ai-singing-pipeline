@@ -1,5 +1,3 @@
-//! CLI for the AI singing pipeline.
-
 #[cfg(feature = "cli")]
 mod cli {
     use clap::{Parser, Subcommand};
