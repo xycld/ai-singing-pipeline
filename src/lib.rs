@@ -4,9 +4,6 @@ pub mod denoise;
 pub mod dsp;
 pub mod mix;
 pub mod pitch_correct;
-pub mod world;
-pub(crate) mod world_sys;
-
 use std::path::{Path, PathBuf};
 
 pub use align::AlignConfig;
@@ -40,8 +37,6 @@ pub enum Error {
     #[error("audio: {0}")]
     Audio(String),
 
-    #[error("sample rate mismatch: user={user} ref={reference}")]
-    SampleRateMismatch { user: i32, reference: i32 },
 
     #[error("pitch correction: {0}")]
     PitchCorrect(String),
@@ -49,8 +44,6 @@ pub enum Error {
     #[error("praat binary not found: {0}")]
     PraatNotFound(PathBuf),
 
-    #[error("praat script not found: {0}")]
-    PraatScriptNotFound(PathBuf),
 
     #[error("alignment: {0}")]
     Alignment(String),

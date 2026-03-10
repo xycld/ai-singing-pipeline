@@ -35,6 +35,3 @@ optional = true
 default = ["cli"]
 cli = ["clap"]
 denoise = ["ort"]
-
-[build-dependencies]
-cc = "1"
