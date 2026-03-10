@@ -2,7 +2,7 @@ use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 
 /// Embedded Praat script — compiled into the binary so it works regardless of CWD.
-const EMBEDDED_PRAAT_SCRIPT: &str = include_str!("../../scripts/pitch_correct.praat");
+const EMBEDDED_PRAAT_SCRIPT: &str = include_str!("../scripts/pitch_correct.praat");
 
 /// Configuration for the pitch correction stage.
 #[derive(Debug, Clone)]
