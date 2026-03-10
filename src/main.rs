@@ -4,17 +4,9 @@ mod cli {
     use std::path::PathBuf;
 
     use ai_singing_pipeline::{
-        AlignConfig, DenoiseConfig, Method, MixConfig, Pipeline, PipelineConfig,
+        AlignConfig, DenoiseConfig, MixConfig, Pipeline, PipelineConfig,
         PitchCorrectConfig, PitchCorrector,
     };
-
-    #[derive(Clone, clap::ValueEnum)]
-    enum CliMethod {
-        Praat,
-        World,
-        Signalsmith,
-        Tdpsola,
-    }
 
     #[derive(Parser)]
     #[command(name = "ai-singing-pipeline")]
@@ -45,10 +37,6 @@ mod cli {
             #[arg(long)]
             denoise_model: Option<PathBuf>,
 
-            /// Pitch correction method
-            #[arg(long, value_enum, default_value_t = CliMethod::Praat)]
-            method: CliMethod,
-
             /// Pitch correction strength 0.0-1.0
             #[arg(long, default_value_t = 0.6)]
             strength: f64,
@@ -57,13 +45,13 @@ mod cli {
             #[arg(long, default_value_t = 50.0)]
             tolerance: f64,
 
-            /// Path to Praat binary
-            #[arg(long, default_value = "praat")]
+            /// Path to Praat binary (required)
+            #[arg(long)]
             praat_bin: PathBuf,
 
-            /// Path to Praat pitch correction script
-            #[arg(long, default_value = "scripts/pitch_correct.praat")]
-            praat_script: PathBuf,
+            /// Path to Praat pitch correction script (uses embedded fallback if omitted)
+            #[arg(long)]
+            praat_script: Option<PathBuf>,
 
             /// Disable emotion alignment in mixing
             #[arg(long)]
@@ -93,7 +81,7 @@ mod cli {
             sr: i32,
         },
 
-        /// Pitch-correct user vocal using reference
+        /// Pitch-correct user vocal using reference (Praat PSOLA)
         PitchCorrect {
             user_wav: PathBuf,
             ref_wav: PathBuf,
@@ -104,15 +92,12 @@ mod cli {
             /// Tolerance in cents
             #[arg(long, default_value_t = 50.0)]
             tolerance: f64,
-            /// Synthesis method
-            #[arg(long, value_enum, default_value_t = CliMethod::Praat)]
-            method: CliMethod,
-            /// Path to Praat binary
-            #[arg(long, default_value = "praat")]
+            /// Path to Praat binary (required)
+            #[arg(long)]
             praat_bin: PathBuf,
-            /// Path to Praat script
-            #[arg(long, default_value = "scripts/pitch_correct.praat")]
-            praat_script: PathBuf,
+            /// Path to Praat script (uses embedded fallback if omitted)
+            #[arg(long)]
+            praat_script: Option<PathBuf>,
         },
 
         /// Mix processed vocal with instrumental using reference-guided parameters
@@ -130,15 +115,6 @@ mod cli {
         },
     }
 
-    fn to_method(m: &CliMethod) -> Method {
-        match m {
-            CliMethod::Praat => Method::Praat,
-            CliMethod::World => Method::World,
-            CliMethod::Signalsmith => Method::Signalsmith,
-            CliMethod::Tdpsola => Method::Tdpsola,
-        }
-    }
-
     pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let cli = Cli::parse();
 
@@ -150,7 +126,6 @@ mod cli {
                 out_wav,
                 sr,
                 denoise_model,
-                method,
                 strength,
                 tolerance,
                 praat_bin,
@@ -162,13 +137,17 @@ mod cli {
                     sample_rate: sr,
                     denoise: denoise_model.map(|p| DenoiseConfig { model_path: p }),
                     align: AlignConfig::default(),
-                    pitch_correct: PitchCorrectConfig {
-                        method: to_method(&method),
-                        strength,
-                        tolerance_cents: tolerance,
-                        praat_bin,
-                        praat_script,
-                        ..Default::default()
+                    pitch_correct: {
+                        let mut pc = PitchCorrectConfig {
+                            strength,
+                            tolerance_cents: tolerance,
+                            praat_bin,
+                            ..Default::default()
+                        };
+                        if let Some(s) = praat_script {
+                            pc.praat_script = s;
+                        }
+                        pc
                     },
                     mix: MixConfig {
                         enable_emotion: !disable_emotion,
@@ -214,30 +193,22 @@ mod cli {
                 out_wav,
                 strength,
                 tolerance,
-                method,
                 praat_bin,
                 praat_script,
             } => {
-                let method = to_method(&method);
-                let method_name = match method {
-                    Method::Praat => "Praat PSOLA",
-                    Method::World => "WORLD vocoder",
-                    Method::Signalsmith => "Signalsmith Stretch",
-                    Method::Tdpsola => "TD-PSOLA",
-                };
                 eprintln!(
-                    "Correcting pitch [{}] (strength={:.0}%, tolerance={:.0} cents)...",
-                    method_name,
+                    "Correcting pitch [Praat PSOLA] (strength={:.0}%, tolerance={:.0} cents)...",
                     strength * 100.0,
                     tolerance,
                 );
 
-                let corrector = PitchCorrector::new()
-                    .method(method)
+                let mut corrector = PitchCorrector::new()
                     .strength(strength)
                     .tolerance_cents(tolerance)
-                    .praat_bin(praat_bin)
-                    .praat_script(praat_script);
+                    .praat_bin(praat_bin);
+                if let Some(s) = praat_script {
+                    corrector = corrector.praat_script(s);
+                }
 
                 let result = corrector.process(&user_wav, &ref_wav, &out_wav)?;
 

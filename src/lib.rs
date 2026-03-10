@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 pub use align::AlignConfig;
 pub use denoise::DenoiseConfig;
 pub use mix::MixConfig;
-pub use pitch_correct::{CorrectionResult, Method, PitchCorrectConfig, PitchCorrector};
+pub use pitch_correct::{CorrectionResult, PitchCorrectConfig, PitchCorrector};
 
 /// Pipeline stages for progress reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
