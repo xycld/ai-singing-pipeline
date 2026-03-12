@@ -51,18 +51,18 @@ fn denoise_onnx(
     }
 
     eprintln!("Loading ONNX model: {}...", config.model_path.display());
-    let session = Session::builder()
+    let mut session = Session::builder()
         .map_err(|e| Error::Denoise(format!("ort session builder: {}", e)))?
         .commit_from_file(&config.model_path)
         .map_err(|e| Error::Denoise(format!("ort load model: {}", e)))?;
 
-    let (samples, sr) = audio::read_wav(input_path).map_err(|e| Error::Audio(e.to_string()))?;
+    let (samples, sr) = crate::audio::read_wav(input_path).map_err(|e| Error::Audio(e.to_string()))?;
 
     let window_size = 2048;
     let hop_size = 512;
 
     eprintln!("Computing STFT...");
-    let stft_frames = audio::stft(&samples, window_size, hop_size);
+    let stft_frames = crate::audio::stft(&samples, window_size, hop_size);
     let n_frames = stft_frames.len();
     let n_bins = window_size / 2 + 1;
 
@@ -83,19 +83,13 @@ fn denoise_onnx(
 
     eprintln!("Running inference ({} frames)...", n_frames);
 
-    let input_shape = vec![1i64, 2, n_bins as i64, n_frames as i64];
-
     let input_tensor = ort::value::Value::from_array(
-        ndarray::ArrayViewD::from_shape(
-            ndarray::IxDyn(&[1, 2, n_bins, n_frames]),
-            &input_data,
-        )
-        .map_err(|e| Error::Denoise(format!("input tensor shape: {}", e)))?,
+        (vec![2i64, n_bins as i64, n_frames as i64], input_data),
     )
     .map_err(|e| Error::Denoise(format!("input tensor: {}", e)))?;
 
     let outputs = session
-        .run(ort::inputs![input_tensor].map_err(|e| Error::Denoise(format!("inputs: {}", e)))?)
+        .run(ort::inputs![input_tensor])
         .map_err(|e| Error::Denoise(format!("inference: {}", e)))?;
 
     let output_tensor = outputs
@@ -106,8 +100,7 @@ fn denoise_onnx(
     let mask_view = output_tensor
         .try_extract_tensor::<f32>()
         .map_err(|e| Error::Denoise(format!("extract output: {}", e)))?;
-    let mask_data = mask_view.as_slice()
-        .ok_or_else(|| Error::Denoise("cannot get mask slice".into()))?;
+    let mask_data = mask_view.1;
 
     eprintln!("Applying mask and reconstructing...");
     let mut masked_frames = stft_frames.clone();
@@ -133,11 +126,11 @@ fn denoise_onnx(
         }
     }
 
-    let vocals = audio::istft(&masked_frames, window_size, hop_size);
+    let vocals = crate::audio::istft(&masked_frames, window_size, hop_size);
 
     let vocals: Vec<f64> = vocals.into_iter().take(samples.len()).collect();
 
-    audio::write_wav(output_path, &vocals, sr).map_err(|e| Error::Audio(e.to_string()))?;
+    crate::audio::write_wav(output_path, &vocals, sr).map_err(|e| Error::Audio(e.to_string()))?;
     eprintln!("Denoising done! -> {}", output_path.display());
 
     Ok(())

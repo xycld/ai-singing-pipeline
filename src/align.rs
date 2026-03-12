@@ -1,8 +1,7 @@
-use crate::{audio, dsp, Error, Result};
+use crate::{audio, Error, Result};
 use std::path::Path;
 
 const FS: i32 = 22050;
-const FEATURE_RATE: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct AlignConfig {
@@ -15,7 +14,12 @@ impl Default for AlignConfig {
     }
 }
 
-/// Load user and reference audio, time-align, and write the result.
+/// Load user and reference audio, time-align at phrase level, and write the result.
+///
+/// Strategy: compute a per-segment time offset via onset cross-correlation,
+/// smooth into a slowly varying offset curve, then apply as a variable delay.
+/// No time-stretching is done — the offset changes so gradually (~0.1%/s)
+/// that the implicit resampling is inaudible.
 pub fn process_align(
     user_path: &Path,
     ref_path: &Path,
@@ -46,33 +50,10 @@ pub fn process_align(
         audio_ref.len() as f64 / FS as f64,
     );
 
-    eprintln!("2. Extracting chroma features...");
-    let chroma_user = extract_chroma(&audio_user, FS, FEATURE_RATE);
-    let chroma_ref = extract_chroma(&audio_ref, FS, FEATURE_RATE);
-    eprintln!(
-        "   User: {} frames, Ref: {} frames",
-        chroma_user.len(),
-        chroma_ref.len()
-    );
-
-    eprintln!("3. DTW alignment...");
-    let step_weights = [1.5, 1.5, 2.0];
-    let band_width = (10.0 * FEATURE_RATE as f64) as usize;
-    let wp = dtw_band(&chroma_user, &chroma_ref, &step_weights, band_width);
-    eprintln!("   Path length: {}", wp.len());
-
-    let time_map: Vec<(f64, f64)> = wp
-        .iter()
-        .map(|&(i, j)| {
-            let src = i as f64 / FEATURE_RATE as f64 * FS as f64;
-            let tgt = j as f64 / FEATURE_RATE as f64 * FS as f64;
-            (src, tgt)
-        })
-        .collect();
-
     let target_len = audio_ref.len();
 
-    eprintln!("4. Adaptive alignment...");
+    // --- Per-segment cross-correlation offsets ---
+    eprintln!("2. Computing per-segment offsets...");
     let eval_hop = 256;
     let o_user = audio::onset_strength(&audio_user, FS, eval_hop);
     let o_ref = audio::onset_strength(&audio_ref, FS, eval_hop);
@@ -82,88 +63,82 @@ pub fn process_align(
     let hop_eval = (2.0 * FS as f64 / eval_hop as f64) as usize;
     let max_lag_eval = (1.5 * FS as f64 / eval_hop as f64) as usize;
 
-    let mut segment_lags: Vec<f64> = Vec::new();
+    // Each entry: (center_sample, offset_seconds)
+    let mut raw_offsets: Vec<(f64, f64)> = Vec::new();
     let mut s = 0;
     while s + win_eval <= n_eval {
         let a = &o_ref[s..s + win_eval];
         let b = &o_user[s..s + win_eval];
         if let Some(best_lag) = cross_correlate_peak(a, b, max_lag_eval) {
-            // Negate: our cross-correlation convention is opposite to scipy's
-            segment_lags.push(-best_lag as f64 * eval_hop as f64 / FS as f64);
+            let center_sample = (s + win_eval / 2) as f64 * eval_hop as f64;
+            let offset_sec = -best_lag as f64 * eval_hop as f64 / FS as f64;
+            raw_offsets.push((center_sample, offset_sec));
         }
         s += hop_eval;
     }
 
-    let (median_offset, pct_good) = if segment_lags.is_empty() {
-        (0.0, 0.0)
-    } else {
-        let mut sorted = segment_lags.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = sorted[sorted.len() / 2];
-        let residuals: Vec<f64> = segment_lags.iter().map(|&l| (l - median).abs()).collect();
-        let good = residuals.iter().filter(|&&r| r < 0.20).count();
-        (median, good as f64 / segment_lags.len() as f64 * 100.0)
-    };
+    if raw_offsets.is_empty() {
+        eprintln!("   No offsets computed, copying input unchanged.");
+        let y_out = if output_sr != FS {
+            audio::resample(&audio_user, FS, output_sr)
+        } else {
+            audio_user
+        };
+        audio::write_wav(output_path, &y_out, output_sr)
+            .map_err(|e| Error::Audio(e.to_string()))?;
+        return Ok(());
+    }
 
-    eprintln!("   Global offset: {:+.3}s", median_offset);
-    eprintln!("   Aligned segments: {:.0}% (residual <200ms)", pct_good);
+    // Global stats for logging.
+    let all_offsets: Vec<f64> = raw_offsets.iter().map(|&(_, o)| o).collect();
+    let mut sorted = all_offsets.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let global_median = sorted[sorted.len() / 2];
+    let good = all_offsets
+        .iter()
+        .filter(|&&o| (o - global_median).abs() < 0.20)
+        .count();
+    let pct_good = good as f64 / all_offsets.len() as f64 * 100.0;
 
-    let y_aligned = if pct_good >= 75.0 {
-        eprintln!("   -> Strategy A: global shift {:+.3}s", median_offset);
-        let shift_samples = (median_offset * FS as f64).round() as isize;
-        apply_global_shift(&audio_user, shift_samples)
-    } else {
-        eprintln!("   -> Strategy B: SmartAlign + WSOLA");
-        let step_b = FEATURE_RATE / 2;
-        let lo = (0.12 * FS as f64) as f64;
-        let hi = (0.40 * FS as f64) as f64;
+    eprintln!("   Segments: {}", raw_offsets.len());
+    eprintln!("   Global median: {:+.3}s", global_median);
+    eprintln!("   Consistent segments: {:.0}%", pct_good);
 
-        let mut timemap: Vec<(usize, usize)> = vec![(0, 0)];
-        let mut prev_src = 0usize;
-        let mut prev_tgt = 0usize;
+    // --- Smooth offset curve ---
+    // 1. Median-filter to remove outliers (window = 7 segments).
+    let filtered = median_filter(&all_offsets, 7);
+    // 2. Build smoothed (center_sample, offset) pairs.
+    let smooth_offsets: Vec<(f64, f64)> = raw_offsets
+        .iter()
+        .zip(filtered.iter())
+        .map(|(&(center, _), &filt_off)| (center, filt_off))
+        .collect();
 
-        let anchor_indices: Vec<usize> = (0..time_map.len())
-            .step_by(step_b.max(1))
-            .skip(1)
-            .collect();
+    eprintln!(
+        "   Offset range: {:+.3}s .. {:+.3}s",
+        filtered.iter().cloned().fold(f64::INFINITY, f64::min),
+        filtered.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+    );
 
-        for &idx in &anchor_indices {
-            if idx >= time_map.len() - 1 {
-                break;
-            }
-            let (src, dtw_tgt) = time_map[idx];
-            let offset = (src - dtw_tgt).abs();
+    // --- Apply variable delay ---
+    eprintln!("3. Applying phrase-level alignment...");
+    let mut y_aligned = vec![0.0f64; target_len];
 
-            // Blend between identity and DTW target based on offset magnitude
-            let alpha = if offset <= lo {
-                0.0
-            } else if offset >= hi {
-                1.0
-            } else {
-                (offset - lo) / (hi - lo)
-            };
+    for i in 0..target_len {
+        let pos = i as f64;
+        // Interpolate the offset at this sample position.
+        let offset_samples = interpolate_offset(&smooth_offsets, pos) * FS as f64;
 
-            let blended = src + alpha * (dtw_tgt - src);
-            let src_int = (src.round() as usize).clamp(1, audio_user.len() - 1);
-            let tgt_int = (blended.round() as usize).clamp(1, target_len - 1);
-
-            if src_int > prev_src && tgt_int > prev_tgt {
-                timemap.push((src_int, tgt_int));
-                prev_src = src_int;
-                prev_tgt = tgt_int;
-            }
+        // Source position: output position minus the offset.
+        let src = pos - offset_samples;
+        if src < 0.0 || src >= (audio_user.len() - 1) as f64 {
+            continue; // silence
         }
-        timemap.push((audio_user.len(), target_len));
-        eprintln!("   Anchors: {}", timemap.len());
-
-        dsp::timemap_stretch(&audio_user, &timemap)
-    };
-
-    let mut y_aligned = y_aligned;
-    if y_aligned.len() > target_len {
-        y_aligned.truncate(target_len);
-    } else {
-        y_aligned.resize(target_len, 0.0);
+        // Linear interpolation in source.
+        let lo = src as usize;
+        let hi = (lo + 1).min(audio_user.len() - 1);
+        let frac = src - lo as f64;
+        y_aligned[i] = audio_user[lo] * (1.0 - frac) + audio_user[hi] * frac;
     }
 
     if config.safe_mode {
@@ -180,7 +155,7 @@ pub fn process_align(
     }
 
     let y_out = if output_sr != FS {
-        eprintln!("5. Resampling {} -> {} Hz...", FS, output_sr);
+        eprintln!("4. Resampling {} -> {} Hz...", FS, output_sr);
         audio::resample(&y_aligned, FS, output_sr)
     } else {
         y_aligned.clone()
@@ -190,6 +165,7 @@ pub fn process_align(
         .map_err(|e| Error::Audio(e.to_string()))?;
     eprintln!("Alignment done! -> {}", output_path.display());
 
+    // Verification mix: user vocal + quiet reference for A/B checking.
     let audio_ref_out = if output_sr != FS {
         audio::resample(&audio_ref, FS, output_sr)
     } else {
@@ -226,238 +202,51 @@ pub fn process_align(
     Ok(())
 }
 
-fn extract_chroma(samples: &[f64], sr: i32, feature_rate: usize) -> Vec<[f64; 12]> {
-    let hop_size = sr as usize / feature_rate;
-    let window_size = 4096;
-    let frames = audio::stft(samples, window_size, hop_size);
-    let bin_hz = sr as f64 / window_size as f64;
+/// Linearly interpolate the offset (in seconds) at a given sample position.
+fn interpolate_offset(offsets: &[(f64, f64)], pos: f64) -> f64 {
+    if offsets.is_empty() {
+        return 0.0;
+    }
+    if offsets.len() == 1 {
+        return offsets[0].1;
+    }
+    // Before first anchor: use first value.
+    if pos <= offsets[0].0 {
+        return offsets[0].1;
+    }
+    // After last anchor: use last value.
+    if pos >= offsets.last().unwrap().0 {
+        return offsets.last().unwrap().1;
+    }
+    // Find bracketing pair and lerp.
+    for w in offsets.windows(2) {
+        let (x0, y0) = w[0];
+        let (x1, y1) = w[1];
+        if pos >= x0 && pos <= x1 {
+            let t = if (x1 - x0).abs() > 1e-6 {
+                (pos - x0) / (x1 - x0)
+            } else {
+                0.5
+            };
+            return y0 + t * (y1 - y0);
+        }
+    }
+    offsets.last().unwrap().1
+}
 
-    frames
-        .iter()
-        .map(|frame| {
-            let mut chroma = [0.0f64; 12];
-            for (k, c) in frame.iter().enumerate() {
-                let freq = k as f64 * bin_hz;
-                if freq < 50.0 || freq > 5000.0 {
-                    continue;
-                }
-                let midi = 69.0 + 12.0 * (freq / 440.0).log2();
-                let pitch_class = ((midi.round() as i32 % 12 + 12) % 12) as usize;
-                let mag = c.norm();
-                chroma[pitch_class] += mag * mag;
-            }
-            let norm = chroma.iter().sum::<f64>().sqrt();
-            if norm > 1e-10 {
-                for v in chroma.iter_mut() {
-                    *v /= norm;
-                }
-            }
-            chroma
+/// 1-D median filter with the given window radius.
+fn median_filter(data: &[f64], window: usize) -> Vec<f64> {
+    let half = window / 2;
+    data.iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let lo = i.saturating_sub(half);
+            let hi = (i + half + 1).min(data.len());
+            let mut win: Vec<f64> = data[lo..hi].to_vec();
+            win.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            win[win.len() / 2]
         })
         .collect()
-}
-
-fn chroma_distance(a: &[f64; 12], b: &[f64; 12]) -> f64 {
-    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
-    let nb: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
-    if na < 1e-10 || nb < 1e-10 {
-        return 1.0;
-    }
-    1.0 - dot / (na * nb)
-}
-
-fn dtw_band(
-    features_a: &[[f64; 12]],
-    features_b: &[[f64; 12]],
-    step_weights: &[f64; 3],
-    band_width: usize,
-) -> Vec<(usize, usize)> {
-    let n = features_a.len();
-    let m = features_b.len();
-    if n == 0 || m == 0 {
-        return vec![];
-    }
-
-    // Full matrix for small inputs; banded for large to avoid ~800MB+ allocations
-    let use_full = (n as u64) * (m as u64) < 100_000_000;
-
-    if use_full {
-        dtw_full(features_a, features_b, step_weights)
-    } else {
-        dtw_banded(features_a, features_b, step_weights, band_width)
-    }
-}
-
-fn dtw_full(
-    a: &[[f64; 12]],
-    b: &[[f64; 12]],
-    w: &[f64; 3],
-) -> Vec<(usize, usize)> {
-    let n = a.len();
-    let m = b.len();
-    let inf = f64::INFINITY;
-
-    let mut d = vec![vec![inf; m]; n];
-    d[0][0] = chroma_distance(&a[0], &b[0]);
-
-    for j in 1..m {
-        d[0][j] = d[0][j - 1] + chroma_distance(&a[0], &b[j]) * w[1];
-    }
-    for i in 1..n {
-        d[i][0] = d[i - 1][0] + chroma_distance(&a[i], &b[0]) * w[0];
-    }
-
-    for i in 1..n {
-        for j in 1..m {
-            let cost = chroma_distance(&a[i], &b[j]);
-            let c1 = d[i - 1][j] + cost * w[0];
-            let c2 = d[i][j - 1] + cost * w[1];
-            let c3 = d[i - 1][j - 1] + cost * w[2];
-            d[i][j] = c1.min(c2).min(c3);
-        }
-    }
-
-    backtrack(&d, n, m)
-}
-
-fn dtw_banded(
-    a: &[[f64; 12]],
-    b: &[[f64; 12]],
-    w: &[f64; 3],
-    band: usize,
-) -> Vec<(usize, usize)> {
-    let n = a.len();
-    let m = b.len();
-    let inf = f64::INFINITY;
-    let bw = band.max(1);
-
-    let strip_w = 2 * bw + 1;
-    let mut d = vec![vec![inf; strip_w]; n];
-
-    // Map global column j to local strip index relative to the diagonal band center
-    let j_center = |i: usize| -> usize { (i as u64 * m as u64 / n as u64) as usize };
-    let j_range = |i: usize| -> (usize, usize) {
-        let center = j_center(i);
-        let lo = center.saturating_sub(bw);
-        let hi = (center + bw).min(m - 1);
-        (lo, hi)
-    };
-    let to_local = |i: usize, j: usize| -> Option<usize> {
-        let (lo, hi) = j_range(i);
-        if j >= lo && j <= hi {
-            Some(j - lo)
-        } else {
-            None
-        }
-    };
-
-    if let Some(jl) = to_local(0, 0) {
-        d[0][jl] = chroma_distance(&a[0], &b[0]);
-    }
-
-    for i in 0..n {
-        let (jlo, jhi) = j_range(i);
-        for j in jlo..=jhi {
-            if i == 0 && j == 0 {
-                continue;
-            }
-            let jl = j - jlo;
-            let cost = chroma_distance(&a[i], &b[j]);
-
-            let mut best = inf;
-            if i > 0 {
-                if let Some(pjl) = to_local(i - 1, j) {
-                    best = best.min(d[i - 1][pjl] + cost * w[0]);
-                }
-            }
-            if j > 0 {
-                if let Some(pjl) = to_local(i, j - 1) {
-                    best = best.min(d[i][pjl] + cost * w[1]);
-                }
-            }
-            if i > 0 && j > 0 {
-                if let Some(pjl) = to_local(i - 1, j - 1) {
-                    best = best.min(d[i - 1][pjl] + cost * w[2]);
-                }
-            }
-
-            d[i][jl] = best;
-        }
-    }
-
-    let mut path = Vec::new();
-    let mut i = n - 1;
-    let mut j = m - 1;
-    path.push((i, j));
-
-    while i > 0 || j > 0 {
-        let mut best = (f64::INFINITY, i, j);
-
-        if i > 0 {
-            if let Some(pjl) = to_local(i - 1, j) {
-                if d[i - 1][pjl] < best.0 {
-                    best = (d[i - 1][pjl], i - 1, j);
-                }
-            }
-        }
-        if j > 0 {
-            if let Some(pjl) = to_local(i, j - 1) {
-                if d[i][pjl] < best.0 {
-                    best = (d[i][pjl], i, j - 1);
-                }
-            }
-        }
-        if i > 0 && j > 0 {
-            if let Some(pjl) = to_local(i - 1, j - 1) {
-                if d[i - 1][pjl] < best.0 {
-                    best = (d[i - 1][pjl], i - 1, j - 1);
-                }
-            }
-        }
-
-        i = best.1;
-        j = best.2;
-        path.push((i, j));
-
-        if i == 0 && j == 0 {
-            break;
-        }
-    }
-
-    path.reverse();
-    path
-}
-
-fn backtrack(d: &[Vec<f64>], n: usize, m: usize) -> Vec<(usize, usize)> {
-    let mut path = Vec::new();
-    let mut i = n - 1;
-    let mut j = m - 1;
-    path.push((i, j));
-
-    while i > 0 || j > 0 {
-        if i == 0 {
-            j -= 1;
-        } else if j == 0 {
-            i -= 1;
-        } else {
-            let candidates = [
-                (d[i - 1][j], i - 1, j),
-                (d[i][j - 1], i, j - 1),
-                (d[i - 1][j - 1], i - 1, j - 1),
-            ];
-            let best = candidates
-                .iter()
-                .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
-                .unwrap();
-            i = best.1;
-            j = best.2;
-        }
-        path.push((i, j));
-    }
-
-    path.reverse();
-    path
 }
 
 fn cross_correlate_peak(a: &[f64], b: &[f64], max_lag: usize) -> Option<isize> {
@@ -519,22 +308,5 @@ fn alignment_score(y_test: &[f64], y_ref: &[f64], hop: usize) -> f64 {
         f64::INFINITY
     } else {
         lags_s.iter().sum::<f64>() / lags_s.len() as f64
-    }
-}
-
-fn apply_global_shift(audio: &[f64], shift_samples: isize) -> Vec<f64> {
-    if shift_samples > 0 {
-        let mut out = vec![0.0; shift_samples as usize];
-        out.extend_from_slice(audio);
-        out
-    } else if shift_samples < 0 {
-        let skip = (-shift_samples) as usize;
-        if skip < audio.len() {
-            audio[skip..].to_vec()
-        } else {
-            vec![]
-        }
-    } else {
-        audio.to_vec()
     }
 }
